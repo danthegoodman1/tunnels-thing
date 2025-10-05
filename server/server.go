@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -26,6 +27,15 @@ type (
 
 	OpenDataConnectionMessage struct {
 		Token string
+	}
+
+	unknownWebsocketMessage struct {
+		Kind string
+		Data json.RawMessage
+	}
+
+	RegisterHostMessage struct {
+		Host string
 	}
 )
 
@@ -77,13 +87,69 @@ func listenForLocalClients(host string) error {
 	mux.HandleFunc("GET /control", func(w http.ResponseWriter, r *http.Request) {
 		m.HandleRequest(w, r)
 	})
+
 	mux.HandleFunc("GET /data", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: splice connection from remote client to local service
+		// Get token from query params
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			http.Error(w, "Missing token", http.StatusBadRequest)
+			return
+		}
+
+		// Look up the pending remote client connection
+		mapMu.Lock()
+		remoteConn, ok := requests[token]
+		if ok {
+			delete(requests, token)
+		}
+		mapMu.Unlock()
+
+		if !ok {
+			http.Error(w, "Invalid token", http.StatusNotFound)
+			return
+		}
+
+		// Hijack the local client connection
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		localConn, _, err := hj.Hijack()
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		// Splice the two connections together (bidirectional copy)
+		go func() {
+			defer localConn.Close()
+			defer remoteConn.Close()
+
+			// Copy in both directions concurrently
+			eg := errgroup.Group{}
+			eg.Go(func() error {
+				_, err := io.Copy(localConn, remoteConn)
+				return err
+			})
+			eg.Go(func() error {
+				_, err := io.Copy(remoteConn, localConn)
+				return err
+			})
+
+			// Wait for either direction to complete (first error or both done)
+			if err := eg.Wait(); err != nil {
+				log.Println("Connection splice error for token:", token, "error:", err)
+				return
+			}
+			log.Println("Connection splice completed for token:", token)
+		}()
 	})
 
 	mux.HandleFunc("/.well-known/acme-challenge", func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
-		fmt.Println("acme challenge for", host)
+		log.Println("acme challenge for", host)
 		// TODO: create autocert handler for domain, shared DB for certs
 		// https://chatgpt.com/c/68d00969-fddc-8333-965c-cd1bdcb63e9a
 		w.WriteHeader(http.StatusNotImplemented)
@@ -97,7 +163,7 @@ func listenForLocalClients(host string) error {
 		mapMu.Unlock()
 
 		// get cert for that domain with HTTP-01 challenge
-		fmt.Println("connected")
+		log.Println("connected")
 	})
 
 	m.HandleDisconnect(func(s *melody.Session) {
@@ -119,13 +185,50 @@ func listenForLocalClients(host string) error {
 		mapMu.Unlock()
 
 		if hasHost {
-			fmt.Println("disconnected:", connectionID, "host:", host)
+			log.Println("disconnected:", connectionID, "host:", host)
 		}
 	})
 
 	m.HandleMessage(func(s *melody.Session, msg []byte) {
-		// TODO: handle message
 		fmt.Println("message", string(msg))
+
+		var unknownMsg unknownWebsocketMessage
+		err := json.Unmarshal(msg, &unknownMsg)
+		if err != nil {
+			s.Write([]byte("Invalid message"))
+			err = s.Close()
+			if err != nil {
+				log.Println("error closing session:", err)
+			}
+			return
+		}
+
+		switch unknownMsg.Kind {
+		case "registerHost":
+			var registerHostMsg RegisterHostMessage
+			err := json.Unmarshal(unknownMsg.Data, &registerHostMsg)
+			if err != nil {
+				s.Write([]byte("Invalid message"))
+				err = s.Close()
+				if err != nil {
+					log.Println("error closing session:", err)
+				}
+				return
+			}
+
+			connectionID := fmt.Sprintf("%p", s)
+			mapMu.Lock()
+			routes.Add(registerHostMsg.Host, routeConfig{
+				Host:         registerHostMsg.Host,
+				ConnectionID: connectionID,
+				Session:      s,
+			})
+			connectionHost[connectionID] = registerHostMsg.Host
+			mapMu.Unlock()
+
+			log.Println("registered host:", registerHostMsg.Host, "for connection:", connectionID)
+		}
+
 	})
 
 	ln, err := net.Listen("tcp", host)
@@ -150,15 +253,25 @@ func listenForRemoteClients(host string) error {
 		}
 
 		token := uuid.New().String()
-		// TODO: write data request to the session with a token
-		b, err := json.Marshal(OpenDataConnectionMessage{
+		// Write data request to the session with a token
+		dataMsg, err := json.Marshal(OpenDataConnectionMessage{
 			Token: token,
 		})
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		err = routeConfig.Session.Write(b)
+
+		msg, err := json.Marshal(unknownWebsocketMessage{
+			Kind: "openDataConnection",
+			Data: dataMsg,
+		})
+		if err != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		err = routeConfig.Session.Write(msg)
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
@@ -179,7 +292,7 @@ func listenForRemoteClients(host string) error {
 
 		// Store the request in the map to be handled later
 		mapMu.Lock()
-		requests[r.Host] = conn
+		requests[token] = conn
 		mapMu.Unlock()
 		// TODO: have some cleanup so we don't leak connections if the local client dies
 	}))
