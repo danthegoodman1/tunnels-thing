@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/danthegoodman1/tunnels-thing/utils"
@@ -39,9 +42,14 @@ type (
 	}
 )
 
+type pendingConnection struct {
+	conn       net.Conn
+	requestBuf *bytes.Buffer
+}
+
 var (
-	// token -> connection
-	requests = map[string]net.Conn{}
+	// token -> pending connection
+	requests = map[string]*pendingConnection{}
 	// pointer (connectionID) -> session
 	sessions = map[string]*melody.Session{}
 	// connectionID -> host (reverse lookup for cleanup)
@@ -55,10 +63,12 @@ var (
 func StartServer() {
 	var config struct {
 		InternalHost string
+		DataHost     string
 		PublicHost   string
 	}
 
-	flag.StringVar(&config.InternalHost, "internal-host", "0.0.0.0:8081", "host for local clients to connect to")
+	flag.StringVar(&config.InternalHost, "internal-host", "0.0.0.0:8081", "host for local clients to connect to (control)")
+	flag.StringVar(&config.DataHost, "data-host", "0.0.0.0:8082", "host for local clients to connect to (data)")
 	flag.StringVar(&config.PublicHost, "public-host", "0.0.0.0:8080", "host for remote clients to connect to")
 
 	flag.Parse()
@@ -66,6 +76,9 @@ func StartServer() {
 	eg := errgroup.Group{}
 	eg.Go(func() error {
 		return listenForLocalClients(config.InternalHost)
+	})
+	eg.Go(func() error {
+		return listenForDataConnections(config.DataHost)
 	})
 	eg.Go(func() error {
 		return listenForRemoteClients(config.PublicHost)
@@ -86,65 +99,6 @@ func listenForLocalClients(host string) error {
 
 	mux.HandleFunc("GET /control", func(w http.ResponseWriter, r *http.Request) {
 		m.HandleRequest(w, r)
-	})
-
-	mux.HandleFunc("GET /data", func(w http.ResponseWriter, r *http.Request) {
-		// Get token from query params
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			http.Error(w, "Missing token", http.StatusBadRequest)
-			return
-		}
-
-		// Look up the pending remote client connection
-		mapMu.Lock()
-		remoteConn, ok := requests[token]
-		if ok {
-			delete(requests, token)
-		}
-		mapMu.Unlock()
-
-		if !ok {
-			http.Error(w, "Invalid token", http.StatusNotFound)
-			return
-		}
-
-		// Hijack the local client connection
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		localConn, _, err := hj.Hijack()
-		if err != nil {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		// Splice the two connections together (bidirectional copy)
-		go func() {
-			defer localConn.Close()
-			defer remoteConn.Close()
-
-			// Copy in both directions concurrently
-			eg := errgroup.Group{}
-			eg.Go(func() error {
-				_, err := io.Copy(localConn, remoteConn)
-				return err
-			})
-			eg.Go(func() error {
-				_, err := io.Copy(remoteConn, localConn)
-				return err
-			})
-
-			// Wait for either direction to complete (first error or both done)
-			if err := eg.Wait(); err != nil {
-				log.Println("Connection splice error for token:", token, "error:", err)
-				return
-			}
-			log.Println("Connection splice completed for token:", token)
-		}()
 	})
 
 	mux.HandleFunc("/.well-known/acme-challenge", func(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +194,76 @@ func listenForLocalClients(host string) error {
 	return httpServer.Serve(ln)
 }
 
+func listenForDataConnections(host string) error {
+	ln, err := net.Listen("tcp", host)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	log.Println("Data connection listener started on", host)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("Failed to accept data connection:", err)
+			continue
+		}
+
+		go handleDataConnection(conn)
+	}
+}
+
+func handleDataConnection(localConn net.Conn) {
+	defer localConn.Close()
+
+	// Read token (first line, newline-terminated)
+	reader := bufio.NewReader(localConn)
+	token, err := reader.ReadString('\n')
+	if err != nil {
+		log.Println("Failed to read token:", err)
+		return
+	}
+	token = strings.TrimSpace(token)
+
+	// Look up the pending remote client connection
+	mapMu.Lock()
+	pending, ok := requests[token]
+	if ok {
+		delete(requests, token)
+	}
+	mapMu.Unlock()
+
+	if !ok {
+		log.Println("Invalid token:", token)
+		return
+	}
+	defer pending.conn.Close()
+
+	log.Println("Splicing connections for token:", token)
+
+	// Splice the connections together
+	// Prepend the HTTP request buffer to the remote connection reads
+	remoteReader := io.MultiReader(pending.requestBuf, pending.conn)
+
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		_, err := io.Copy(localConn, remoteReader)
+		return err
+	})
+	eg.Go(func() error {
+		// Use reader to preserve any buffered data from token read
+		_, err := io.Copy(pending.conn, reader)
+		return err
+	})
+
+	if err := eg.Wait(); err != nil {
+		log.Println("Connection splice error for token:", token, "error:", err)
+		return
+	}
+	log.Println("Connection splice completed for token:", token)
+}
+
 func listenForRemoteClients(host string) error {
 	// TODO: make a TCP listener that can handle SNI or HTTP(s) like in Gildra
 	return http.ListenAndServe(host, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -290,9 +314,21 @@ func listenForRemoteClients(host string) error {
 			return
 		}
 
-		// Store the request in the map to be handled later
+		// Serialize the HTTP request to a buffer (since it was already consumed)
+		requestBuf := &bytes.Buffer{}
+		err = r.Write(requestBuf)
+		if err != nil {
+			log.Println("Failed to serialize HTTP request:", err)
+			conn.Close()
+			return
+		}
+
+		// Store the connection and request buffer in the map
 		mapMu.Lock()
-		requests[token] = conn
+		requests[token] = &pendingConnection{
+			conn:       conn,
+			requestBuf: requestBuf,
+		}
 		mapMu.Unlock()
 		// TODO: have some cleanup so we don't leak connections if the local client dies
 	}))

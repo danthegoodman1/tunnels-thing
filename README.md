@@ -41,3 +41,22 @@ Cloudflare tunnels was too complicated to figure out, so I made my own.
 │ (localhost:8080)│
 └─────────────────┘
 ```
+
+
+## Testing
+
+```
+docker run -p 8090:8080 mendhak/http-https-echo
+```
+
+```
+go run . server
+```
+
+```
+go run . client --service-port 8090 --register-host example.com
+```
+
+```
+curl -H "Host: example.com" http://localhost:8080/test
+```

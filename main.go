@@ -9,11 +9,15 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 {
+	if len(os.Args) < 2 {
 		fmt.Println("must use either 'server' or 'client'")
 		os.Exit(1)
 	}
 	role := os.Args[1]
+
+	// Remove the role argument so flags parse correctly
+	os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+
 	switch role {
 	case "server":
 		server.StartServer()
