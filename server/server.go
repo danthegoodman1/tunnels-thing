@@ -53,7 +53,6 @@ func StartServer() {
 
 	flag.Parse()
 
-	// TODO: TCP listening for both local service clients and remote clients
 	eg := errgroup.Group{}
 	eg.Go(func() error {
 		return listenForLocalClients(config.InternalHost)
@@ -139,7 +138,7 @@ func listenForLocalClients(host string) error {
 }
 
 func listenForRemoteClients(host string) error {
-	// TODO: make a TCP server that can handle SNI or HTTP(s) like in Gildra
+	// TODO: make a TCP listener that can handle SNI or HTTP(s) like in Gildra
 	return http.ListenAndServe(host, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Find the route config for the host
 		mapMu.Lock()
