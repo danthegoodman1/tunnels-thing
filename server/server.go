@@ -38,7 +38,7 @@ var (
 	connectionHost = map[string]string{}
 	mapMu          = &sync.Mutex{}
 
-	// key is the host
+	// host -> route configs
 	routes = utils.NewOneToMany[string, routeConfig]()
 )
 
