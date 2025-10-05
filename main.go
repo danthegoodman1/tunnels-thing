@@ -3,6 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/danthegoodman1/tunnels-thing/client"
+	"github.com/danthegoodman1/tunnels-thing/server"
 )
 
 func main() {
@@ -13,9 +16,9 @@ func main() {
 	role := os.Args[1]
 	switch role {
 	case "server":
-		startServer()
+		server.StartServer()
 	case "client":
-		startClient()
+		client.StartClient()
 	default:
 		fmt.Println("must use either 'server' or 'client'")
 		os.Exit(1)

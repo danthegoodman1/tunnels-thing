@@ -1,8 +1,8 @@
-package main
+package client
 
 import "flag"
 
-func startClient() {
+func StartClient() {
 	var config struct {
 		Host string
 		Port int
